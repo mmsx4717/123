@@ -12,11 +12,64 @@ app.secret_key = os.getenv('FLASK_APP_SECRET_KEY') # 设置 Flask 密钥
 
 # DeepSeek API 配置
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
-DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions" # 注意检查官方文档确认最新 URL
+DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"  # 注意检查官方文档确认最新 URL
 
-# 检查 API Key 是否已配置
-if not DEEPSEEK_API_KEY:
-    raise ValueError("错误：未在 .env 文件中设置 DEEPSEEK_API_KEY")
+# 超时时间和重试次数（可通过环境变量配置）
+DEEPSEEK_TIMEOUT = float(os.getenv('DEEPSEEK_TIMEOUT', '120'))  # 默认 120 秒
+DEEPSEEK_MAX_RETRIES = int(os.getenv('DEEPSEEK_MAX_RETRIES', '2'))  # 默认最多重试 2 次
+
+
+def call_deepseek(messages):
+    """
+    调用 DeepSeek 的封装，带超时配置和简单重试。
+    """
+    if not DEEPSEEK_API_KEY:
+        raise ValueError("错误：未在 .env 文件中设置 DEEPSEEK_API_KEY")
+
+    payload = {
+        "model": "deepseek-chat",  # 根据 DeepSeek 文档确认模型名称
+        "messages": messages,
+        "stream": False,  # 先用非流式
+    }
+
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    last_error = None
+    for attempt in range(1, DEEPSEEK_MAX_RETRIES + 2):  # 首次请求 + 若干次重试
+        try:
+            response = requests.post(
+                DEEPSEEK_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=DEEPSEEK_TIMEOUT,
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                ai_message = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                if not ai_message:
+                    raise ValueError("从 DeepSeek API 返回的数据中没有找到 message.content")
+                return ai_message
+
+            # 非 200，记录错误信息，视为一次失败
+            last_error = f"状态码 {response.status_code}, 响应: {response.text}"
+            print(f"[DeepSeek 调用失败][第 {attempt} 次] {last_error}")
+
+        except requests.exceptions.Timeout as e:
+            last_error = f"请求 DeepSeek API 超时（第 {attempt} 次），超时时间 {DEEPSEEK_TIMEOUT} 秒: {e}"
+            print(last_error)
+        except requests.exceptions.RequestException as e:
+            last_error = f"请求 DeepSeek API 发生网络相关异常（第 {attempt} 次）: {e}"
+            print(last_error)
+        except Exception as e:
+            last_error = f"处理 DeepSeek 响应时发生未知错误（第 {attempt} 次）: {e}"
+            print(last_error)
+
+    # 所有尝试均失败
+    raise RuntimeError(last_error or "调用 DeepSeek API 失败，原因未知")
 
 @app.route('/')
 def index():
@@ -35,58 +88,33 @@ def chat():
     }
     """
     data = request.get_json()
-    
+
     # 基本校验
     if not data or 'messages' not in data or not isinstance(data['messages'], list):
-         return jsonify({"error": "请求体格式错误，缺少 'messages' 列表"}), 400
+        return jsonify({"error": "请求体格式错误，缺少 'messages' 列表"}), 400
 
     user_messages = data['messages']
 
-    # 准备发送给 DeepSeek API 的数据
-    payload = {
-        "model": "deepseek-chat", # 根据 DeepSeek 文档确认模型名称
-        "messages": user_messages,
-        "stream": False # 我们先处理非流式响应
-        # 可以根据需要添加 temperature, max_tokens 等参数
-    }
-
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
     try:
-        # 调用 DeepSeek API
-        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=60)
-        
-        # 检查 DeepSeek API 响应状态码
-        if response.status_code == 200:
-            response_data = response.json()
-            
-            # 提取 AI 的回复
-            ai_message = response_data.get('choices', [{}])[0].get('message', {}).get('content', '')
-            
-            if ai_message:
-                # 返回 AI 回复给小程序
-                return jsonify({"reply": ai_message}), 200
-            else:
-                return jsonify({"error": "未能从 DeepSeek API 获取有效回复内容"}), 500
-        
-        else:
-            # DeepSeek API 返回了错误
-            error_info = response.text
-            print(f"DeepSeek API 错误 ({response.status_code}): {error_info}") # 服务端日志
-            return jsonify({
-                "error": f"调用 DeepSeek API 失败",
-                "details": error_info # 可以选择性返回详细信息给前端
-            }), response.status_code
+        # 调用 DeepSeek（带超时和重试）
+        ai_message = call_deepseek(user_messages)
 
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "请求 DeepSeek API 超时"}), 504 # Gateway Timeout
-    except requests.exceptions.RequestException as e:
-        # 网络或其他请求相关错误
-        print(f"请求 DeepSeek API 时发生异常: {e}")
-        return jsonify({"error": "内部服务器错误，无法连接到 DeepSeek API"}), 500
+        # 正常拿到回复
+        return jsonify({
+            "reply": ai_message,
+            "meta": {
+                "timeout": DEEPSEEK_TIMEOUT,
+                "max_retries": DEEPSEEK_MAX_RETRIES,
+            }
+        }), 200
+
+    except RuntimeError as e:
+        # 所有重试都失败
+        print(f"调用 DeepSeek 失败（已重试）: {e}")
+        return jsonify({
+            "error": "调用 DeepSeek 失败，请稍后重试",
+            "details": str(e)
+        }), 502  # Bad Gateway，更贴近“上游服务失败”
     except Exception as e:
         # 其他意外错误
         print(f"处理请求时发生未知错误: {e}")
